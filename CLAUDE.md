@@ -26,6 +26,13 @@ uv run python preparse_games.py
 
 There is no test suite.
 
+## Documentation Conventions
+
+- Use `docs/` for local planning notes, recommendations, implementation plans, scratch documentation, and other ad-hoc markdown files created during work.
+- The `docs/` folder is gitignored on purpose, so files placed there will stay local and not be committed unless explicitly requested.
+- Only put documentation in the repo root when it is intended to be part of the tracked project itself (for example: `README.md` or other intentionally versioned project docs).
+- If asked to "add docs" without further clarification, prefer creating them under `docs/`.
+
 ## Architecture
 
 Four source files:
