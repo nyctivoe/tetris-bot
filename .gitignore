@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Training artifacts
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Large/generated data
+data.csv
+game_index.csv
+game_cache_v2/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
