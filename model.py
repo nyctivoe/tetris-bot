@@ -62,7 +62,7 @@ BOARD_W = 10
 VISIBLE_H = 20
 HIDDEN_ROWS = BOARD_H - VISIBLE_H
 
-NUM_BOARD_CHANNELS = 6
+NUM_BOARD_CHANNELS = 7
 NUM_STATS = 7
 QUEUE_SLOTS = 5
 
@@ -163,11 +163,79 @@ def _split_entries(entries, train_split):
 
 
 # ---------------------------------------------------------------------
+# T-slot detection (shared by feature channels and reward shaping)
+# ---------------------------------------------------------------------
+# T-piece body offsets per rotation within a 3x3 bounding box.
+_T_BODY_OFFSETS = [
+    [(1, 0), (0, 1), (1, 1), (2, 1)],  # Rot 0 (up)
+    [(1, 0), (1, 1), (2, 1), (1, 2)],  # Rot 1 (right)
+    [(0, 1), (1, 1), (2, 1), (1, 2)],  # Rot 2 (down)
+    [(1, 0), (0, 1), (1, 1), (1, 2)],  # Rot 3 (left)
+]
+# 3x3 bounding-box corner offsets (same for every rotation).
+_T_CORNER_OFFSETS = [(0, 0), (2, 0), (0, 2), (2, 2)]
+
+
+def detect_tslots(board: np.ndarray) -> np.ndarray:
+    """Detect T-slot cavities on a board using the 3-corner rule.
+
+    Returns a (H, W) float32 mask where 1.0 marks cells that are part of a
+    valid T-slot cavity (the empty body cells where a T-piece could T-spin).
+    Fully vectorized — no Python loops over board positions.
+
+    Accessibility filter: the center column of the 3x3 bounding box must
+    have no filled cells above the slot's top row, ensuring the cavity is
+    reachable from above (not buried under existing blocks).
+    """
+    H, W = board.shape
+    occ = board != 0  # bool (H, W)
+
+    # Valid placement grid: 3x3 box must fit on board.
+    ph = H - 2  # number of valid top-left y positions
+    pw = W - 2  # number of valid top-left x positions
+
+    # Corner occupancy sum — same for all rotations.
+    corner_sum = (
+        occ[:ph, :pw].astype(np.int8)
+        + occ[:ph, 2:2 + pw].astype(np.int8)
+        + occ[2:2 + ph, :pw].astype(np.int8)
+        + occ[2:2 + ph, 2:2 + pw].astype(np.int8)
+    )  # shape (ph, pw)
+
+    # Accessibility check: center column (x+1) must have no filled cells
+    # above the slot's top row y.  col_first_filled[c] = first filled row
+    # index from top in column c (H if the column is entirely empty).
+    col_first_filled = np.where(
+        occ.any(axis=0), np.argmax(occ, axis=0), H
+    ).astype(np.int32)  # shape (W,)
+    center_col_first = col_first_filled[1:1 + pw]  # shape (pw,)
+    y_rows = np.arange(ph, dtype=np.int32)          # shape (ph,)
+    # accessible[y, x] = True iff no filled cell in col x+1 above row y
+    accessible = center_col_first[np.newaxis, :] >= y_rows[:, np.newaxis]  # (ph, pw)
+
+    out = np.zeros((H, W), dtype=np.float32)
+
+    for body in _T_BODY_OFFSETS:
+        # All 4 body cells must be empty at each candidate position.
+        body_empty = np.ones((ph, pw), dtype=bool)
+        for dx, dy in body:
+            body_empty &= ~occ[dy:dy + ph, dx:dx + pw]
+
+        tslot_pos = body_empty & (corner_sum >= 3) & accessible  # (ph, pw)
+
+        # Paint body cells onto output mask for every detected T-slot.
+        for dx, dy in body:
+            out[dy:dy + ph, dx:dx + pw] += tslot_pos
+
+    return np.clip(out, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------
 # Feature engineering
 # ---------------------------------------------------------------------
 def compute_board_features(base_board: np.ndarray, result_board: np.ndarray) -> np.ndarray:
     """
-    6-channel float32 tensor from (base_board, result_board).
+    7-channel float32 tensor from (base_board, result_board).
     Vectorized for maximum speed.
     """
     H, W = base_board.shape
@@ -189,7 +257,10 @@ def compute_board_features(base_board: np.ndarray, result_board: np.ndarray) -> 
     row_fill = res_occ.sum(axis=1, keepdims=True) / float(W)
     row_fill_map = np.broadcast_to(row_fill, (H, W)).copy()
 
-    return np.stack([base_occ, res_occ, diff, height_map, holes, row_fill_map], axis=0)
+    # T-slot cavity map on the result board
+    tslot_map = detect_tslots(result_board)
+
+    return np.stack([base_occ, res_occ, diff, height_map, holes, row_fill_map, tslot_map], axis=0)
 
 
 def encode_stats(row: dict, base_board: np.ndarray, result_board: np.ndarray) -> np.ndarray:
@@ -265,19 +336,39 @@ def build_2d_sincos_pos_embed(h: int, w: int, embed_dim: int) -> torch.Tensor:
 # ---------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------
+class _ResidualConvBlock(nn.Module):
+    """Conv + BN + ReLU with a residual shortcut (handles stride and channel mismatch)."""
+
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, stride=stride)
+        self.bn = nn.BatchNorm2d(out_ch)
+
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.AvgPool2d(kernel_size=stride, stride=stride, ceil_mode=True) if stride > 1 else nn.Identity(),
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        return torch.relu(self.bn(self.conv(x)) + self.shortcut(x))
+
+
 class TetrisFormerV4(nn.Module):
-    def __init__(self, embed_dim=128, num_heads=4, depth=4,
+    def __init__(self, embed_dim=192, num_heads=6, depth=4,
                  board_channels=NUM_BOARD_CHANNELS, num_stats=NUM_STATS):
         super().__init__()
 
-        self.cnn_embed = nn.Sequential(
+        # CNN with residual connections (skip connections on stride-2 layers).
+        self.cnn_stem = nn.Sequential(
             nn.Conv2d(board_channels, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32), nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(64), nn.ReLU(),
-            nn.Conv2d(64, embed_dim, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(embed_dim), nn.ReLU(),
         )
+        self.cnn_res1 = _ResidualConvBlock(32, 64, stride=2)
+        self.cnn_res2 = _ResidualConvBlock(64, embed_dim, stride=2)
 
         self.piece_embedding = nn.Embedding(8, embed_dim)
         self.queue_pos_embed = nn.Parameter(torch.randn(1, 10, embed_dim))
@@ -286,9 +377,10 @@ class TetrisFormerV4(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
-            dim_feedforward=4 * embed_dim,  # standard 4× ratio; PyTorch default of 2048 assumes d_model=512
+            dim_feedforward=4 * embed_dim,
             batch_first=True,
             dropout=0.1,
+            norm_first=True,  # pre-LayerNorm: more stable training
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
 
@@ -316,7 +408,7 @@ class TetrisFormerV4(nn.Module):
         return self._grid_pos_embed
 
     def forward(self, x_board, x_queue, x_stats):
-        vis_feats = self.cnn_embed(x_board)
+        vis_feats = self.cnn_res2(self.cnn_res1(self.cnn_stem(x_board)))
         B, C, Hf, Wf = vis_feats.shape
         grid_tokens = vis_feats.view(B, C, Hf * Wf).permute(0, 2, 1)
         grid_tokens = grid_tokens + self._get_grid_pos_embed(Hf, Wf, grid_tokens.device)
@@ -511,21 +603,30 @@ def _apply_placement_fields_to_current_piece(engine, placement: dict):
     return bool(valid)
 
 
-def _board_shape_metrics(board: np.ndarray) -> Tuple[float, float]:
+def _board_shape_metrics(board: np.ndarray, tslot_hole_discount: float = 0.5) -> Tuple[float, float, float]:
     occ = (board != 0).astype(np.float32)
     H, W = occ.shape
-    
+
     mask = occ > 0
     y_indices = np.argmax(mask, axis=0)
     col_h = np.where(mask.any(axis=0), H - y_indices, 0).astype(np.float32)
-    
-    blocks_above = np.cumsum(mask, axis=0)
-    holes = int(((occ == 0) & (blocks_above > 0)).sum())
 
-    return float(col_h.max()) / float(VISIBLE_H), min(holes, 20) / 20.0
+    blocks_above = np.cumsum(mask, axis=0)
+    all_holes = (occ == 0) & (blocks_above > 0)
+
+    # Discount holes that are part of a complete, accessible T-slot cavity.
+    tslot_mask = detect_tslots(board)
+    has_tslot = float(tslot_mask.any())
+    productive = all_holes & (tslot_mask > 0)
+    unproductive = all_holes & (tslot_mask == 0)
+    effective_holes = float(unproductive.sum()) + (1.0 - tslot_hole_discount) * float(productive.sum())
+
+    return float(col_h.max()) / float(VISIBLE_H), min(effective_holes, 20) / 20.0, has_tslot
 
 
 def _is_tspin_from_stats(clear_stats: dict) -> float:
+    if clear_stats.get("lines_cleared", 0) <= 0:
+        return 0.0
     spin = clear_stats.get("spin")
     if isinstance(spin, dict):
         desc = str(spin.get("description", "")).lower()
@@ -543,7 +644,8 @@ def _compute_rollout_reward(board_after: np.ndarray,
                             b2b_bonus: float,
                             height_penalty: float,
                             holes_penalty: float,
-                            topout_penalty: float) -> Tuple[float, float]:
+                            topout_penalty: float,
+                            tslot_ready_bonus: float = 0.0) -> Tuple[float, float]:
     attack = float(_safe_float(clear_stats.get("attack", 0.0)))
     tspin = _is_tspin_from_stats(clear_stats)
 
@@ -553,12 +655,13 @@ def _compute_rollout_reward(board_after: np.ndarray,
     elif prev_b2b > 0 and attack > 0:
         b2b_cont = 1.0
 
-    height_norm, holes_norm = _board_shape_metrics(board_after)
+    height_norm, holes_norm, has_tslot = _board_shape_metrics(board_after)
 
     reward = 0.0
     reward += attack_w * attack
     reward += tspin_bonus * tspin
     reward += b2b_bonus * b2b_cont
+    reward += tslot_ready_bonus * has_tslot
     reward -= height_penalty * height_norm
     reward -= holes_penalty * holes_norm
     reward -= topout_penalty * float(game_over)
@@ -574,7 +677,8 @@ def _simulate_current_placement(engine,
                                 b2b_bonus: float,
                                 height_penalty: float,
                                 holes_penalty: float,
-                                topout_penalty: float):
+                                topout_penalty: float,
+                                tslot_ready_bonus: float = 0.0):
     sim = _clone_engine(engine)
 
     if sim.current_piece is None:
@@ -587,7 +691,7 @@ def _simulate_current_placement(engine,
         reward, attack = _compute_rollout_reward(
             sim.board, {}, int(getattr(sim, "b2b_chain", 0)), True,
             attack_w, tspin_bonus, b2b_bonus,
-            height_penalty, holes_penalty, topout_penalty
+            height_penalty, holes_penalty, topout_penalty, tslot_ready_bonus
         )
         return sim, reward, attack
 
@@ -625,7 +729,7 @@ def _simulate_current_placement(engine,
     reward, attack = _compute_rollout_reward(
         sim.board, clear_stats, prev_b2b, bool(sim.game_over),
         attack_w, tspin_bonus, b2b_bonus,
-        height_penalty, holes_penalty, topout_penalty
+        height_penalty, holes_penalty, topout_penalty, tslot_ready_bonus
     )
     return sim, reward, attack
 
@@ -660,7 +764,8 @@ def _beam_rollout_future(engine_after_root,
                          height_penalty: float,
                          holes_penalty: float,
                          topout_penalty: float,
-                         bootstrap_leaf: bool = False) -> float:
+                         bootstrap_leaf: bool = False,
+                         tslot_ready_bonus: float = 0.0) -> float:
     if depth_remaining <= 0:
         if bootstrap_leaf:
             return _leaf_value_from_target(engine_after_root)
@@ -709,7 +814,7 @@ def _beam_rollout_future(engine_after_root,
                 sim_eng, step_reward, _step_attack = _simulate_current_placement(
                     eng, placement, next_piece_kind,
                     attack_w, tspin_bonus, b2b_bonus,
-                    height_penalty, holes_penalty, topout_penalty,
+                    height_penalty, holes_penalty, topout_penalty, tslot_ready_bonus,
                 )
 
                 if sim_eng is None:
@@ -763,7 +868,8 @@ def _compute_candidate_rollout_q(root_engine,
                                  height_penalty: float,
                                  holes_penalty: float,
                                  topout_penalty: float,
-                                 bootstrap_leaf: bool = False) -> Tuple[float, float]:
+                                 bootstrap_leaf: bool = False,
+                                 tslot_ready_bonus: float = 0.0) -> Tuple[float, float]:
     next_piece_kind = future_piece_kinds[0] if len(future_piece_kinds) > 0 else None
 
     after_engine, r0, immediate_attack = _simulate_current_placement(
@@ -771,7 +877,7 @@ def _compute_candidate_rollout_q(root_engine,
         placement,
         next_piece_kind,
         attack_w, tspin_bonus, b2b_bonus,
-        height_penalty, holes_penalty, topout_penalty,
+        height_penalty, holes_penalty, topout_penalty, tslot_ready_bonus,
     )
     if after_engine is None:
         return -topout_penalty, 0.0
@@ -794,6 +900,7 @@ def _compute_candidate_rollout_q(root_engine,
         holes_penalty=holes_penalty,
         topout_penalty=topout_penalty,
         bootstrap_leaf=bootstrap_leaf,
+        tslot_ready_bonus=tslot_ready_bonus,
     )
 
     q_total = float(r0) + float(gamma) * float(future_return)
@@ -835,6 +942,7 @@ class SmartRolloutRankDataset(IterableDataset):
                  reward_height_penalty=0.05,
                  reward_holes_penalty=0.08,
                  reward_topout_penalty=2.5,
+                 reward_tslot_ready_bonus=0.0,
                  seed=1234,
                  use_bootstrap=False):
         self.entries = entries
@@ -861,6 +969,7 @@ class SmartRolloutRankDataset(IterableDataset):
         self.reward_height_penalty = float(reward_height_penalty)
         self.reward_holes_penalty = float(reward_holes_penalty)
         self.reward_topout_penalty = float(reward_topout_penalty)
+        self.reward_tslot_ready_bonus = float(reward_tslot_ready_bonus)
 
         self.seed = int(seed)
 
@@ -972,6 +1081,7 @@ class SmartRolloutRankDataset(IterableDataset):
                         holes_penalty=self.reward_holes_penalty,
                         topout_penalty=self.reward_topout_penalty,
                         bootstrap_leaf=self.use_bootstrap and (_get_target_model() is not None),
+                        tslot_ready_bonus=self.reward_tslot_ready_bonus,
                     )
                     q_raw_list.append(q_raw)
                     attack_raw_list.append(atk_raw)
@@ -1058,6 +1168,7 @@ def main():
     parser.add_argument("--reward-height-penalty", type=float, default=0.1)    # was 0.05; height kills
     parser.add_argument("--reward-holes-penalty", type=float, default=0.5)     # was 0.08; holes are catastrophic
     parser.add_argument("--reward-topout-penalty", type=float, default=10.0)   # was 2.5; game-over should dominate
+    parser.add_argument("--reward-tslot-ready-bonus", type=float, default=0.3)  # per-step bonus for having a complete accessible T-slot on the board
 
     # Loss weights
     parser.add_argument("--soft-rank-loss-weight", type=float, default=1.0)
@@ -1072,10 +1183,18 @@ def main():
     parser.add_argument("--log-every", type=int, default=500)
 
     # Bootstrapped value leaves (AlphaZero trick)
-    parser.add_argument("--bootstrap-start-epoch", type=int, default=5,
+    parser.add_argument("--bootstrap-start-epoch", type=int, default=3,
                         help="Epoch after which leaf states are bootstrapped via target network.")
     parser.add_argument("--target-ema-tau", type=float, default=0.005,
                         help="Polyak coefficient for EMA target network update.")
+
+    # Training stability / efficiency
+    parser.add_argument("--grad-clip", type=float, default=1.0,
+                        help="Max gradient norm (0 to disable).")
+    parser.add_argument("--warmup-steps", type=int, default=500,
+                        help="Linear LR warmup steps before cosine decay.")
+    parser.add_argument("--min-lr", type=float, default=1e-6,
+                        help="Minimum LR at end of cosine schedule.")
 
     args, _ = parser.parse_known_args()
 
@@ -1116,6 +1235,7 @@ def main():
         reward_height_penalty=args.reward_height_penalty,
         reward_holes_penalty=args.reward_holes_penalty,
         reward_topout_penalty=args.reward_topout_penalty,
+        reward_tslot_ready_bonus=args.reward_tslot_ready_bonus,
         seed=args.seed,
     )
 
@@ -1139,6 +1259,7 @@ def main():
         reward_height_penalty=args.reward_height_penalty,
         reward_holes_penalty=args.reward_holes_penalty,
         reward_topout_penalty=args.reward_topout_penalty,
+        reward_tslot_ready_bonus=args.reward_tslot_ready_bonus,
         seed=args.seed + 999,
         use_bootstrap=False,   # bootstrap toggled per-epoch below
     )
@@ -1174,6 +1295,22 @@ def main():
     register_target_model(model, device)
 
     optimizer = optim.AdamW(model.model.parameters(), lr=args.lr, weight_decay=1e-2)
+
+    # Cosine LR schedule with linear warmup.
+    total_steps_estimate = args.epochs * (args.samples_per_epoch // max(args.batch_size, 1))
+
+    def _lr_lambda(step):
+        if step < args.warmup_steps:
+            return max(float(step) / max(args.warmup_steps, 1), 1e-2)
+        progress = (step - args.warmup_steps) / max(total_steps_estimate - args.warmup_steps, 1)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+        return max(cosine, args.min_lr / args.lr)
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+
+    # Mixed precision (only on CUDA).
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     ce_criterion = nn.CrossEntropyLoss(reduction="none", label_smoothing=0.05)
     smooth_l1 = nn.SmoothL1Loss(reduction="none")
@@ -1259,42 +1396,48 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            rank_scores, pred_attack, pred_q = model(boards_flat, queues_flat, stats_flat)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                rank_scores, pred_attack, pred_q = model(boards_flat, queues_flat, stats_flat)
 
-            rank_logits = rank_scores.squeeze(-1).reshape(B, K)
-            pred_attack = pred_attack.squeeze(-1).reshape(B, K)
-            pred_q = pred_q.squeeze(-1).reshape(B, K)
+                rank_logits = rank_scores.squeeze(-1).reshape(B, K)
+                pred_attack = pred_attack.squeeze(-1).reshape(B, K)
+                pred_q = pred_q.squeeze(-1).reshape(B, K)
 
-            # 1) Soft rank loss from rollout-return distribution.
-            log_probs = torch.log_softmax(rank_logits, dim=1)
-            soft_rank_loss = -(soft_targets * log_probs).sum(dim=1)
-            soft_rank_loss = (soft_rank_loss * weights).mean()
+                # 1) Soft rank loss from rollout-return distribution.
+                log_probs = torch.log_softmax(rank_logits, dim=1)
+                soft_rank_loss = -(soft_targets * log_probs).sum(dim=1)
+                soft_rank_loss = (soft_rank_loss * weights).mean()
 
-            # 2) Q regression on all K candidates.
-            q_loss_per = smooth_l1(pred_q, q_targets).mean(dim=1)
-            q_loss = (q_loss_per * weights).mean()
+                # 2) Q regression on all K candidates.
+                q_loss_per = smooth_l1(pred_q, q_targets).mean(dim=1)
+                q_loss = (q_loss_per * weights).mean()
 
-            # 3) Immediate attack regression on all K candidates.
-            attack_loss_per = smooth_l1(pred_attack, attack_targets).mean(dim=1)
-            attack_loss = (attack_loss_per * weights).mean()
+                # 3) Immediate attack regression on all K candidates.
+                attack_loss_per = smooth_l1(pred_attack, attack_targets).mean(dim=1)
+                attack_loss = (attack_loss_per * weights).mean()
 
-            # 4) Weak expert imitation.
-            imit_loss = ce_criterion(rank_logits, expert_labels)
-            imit_loss = (imit_loss * weights).mean()
+                # 4) Weak expert imitation.
+                imit_loss = ce_criterion(rank_logits, expert_labels)
+                imit_loss = (imit_loss * weights).mean()
 
-            loss = (
-                args.soft_rank_loss_weight * soft_rank_loss
-                + args.q_loss_weight * q_loss
-                + args.attack_loss_weight * attack_loss
-                + args.imit_loss_weight * imit_loss
-            )
+                loss = (
+                    args.soft_rank_loss_weight * soft_rank_loss
+                    + args.q_loss_weight * q_loss
+                    + args.attack_loss_weight * attack_loss
+                    + args.imit_loss_weight * imit_loss
+                )
 
             if not torch.isfinite(loss):
                 master_print(f"[WARN] Non-finite loss at epoch {epoch}; skipping batch.")
                 continue
 
-            loss.backward()
-            optimizer_step(optimizer)
+            scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
 
             # Soft-update the EMA target network after every gradient step.
             if bootstrap_active:
@@ -1369,7 +1512,8 @@ def main():
                 queues_flat = queues.reshape(B * K, L)
                 stats_flat = stats.reshape(B * K, S)
 
-                rank_scores, _pred_attack, pred_q = model(boards_flat, queues_flat, stats_flat)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    rank_scores, _pred_attack, pred_q = model(boards_flat, queues_flat, stats_flat)
                 rank_logits = rank_scores.squeeze(-1).reshape(B, K)
                 pred_q = pred_q.squeeze(-1).reshape(B, K)
 
