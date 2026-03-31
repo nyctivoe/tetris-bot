@@ -48,17 +48,23 @@ uv run python model.py
 ### Model: TetrisFormerV4
 
 ```
-6-channel board (40x10)
-    -> CNN Encoder (3 conv layers, stride-2 on layers 2-3) -> 30 grid tokens (128-dim)
+7-channel board features (40x10)
+    -> CNN stem (Conv 7->32, 3x3 + BN + ReLU)
+    -> Residual block (32->64, stride 2)
+    -> Residual block (64->192, stride 2)
+    -> 30 grid tokens (10x3, 192-dim) + 2D sin/cos positional encoding
 
-CLS token + Stats token (7-dim game state) + Queue tokens (7: placed + hold + 5 next)
-    -> Transformer Encoder (4 layers, 4 heads, 128-dim, FFN=512)
+CLS token + Stats token (7 scalars -> Linear 7->192) + Queue tokens (7: current/placed + hold + 5 next)
+    -> Transformer Encoder (4 layers, 6 heads, 192-dim, FFN=768, dropout=0.1, pre-LN)
     -> CLS output
 
-CLS -> Rank Head    (Linear 128->256->1)
-    -> Attack Head  (Linear 128->128->1)
-    -> Q Head       (Linear 128->256->64->1, with dropout)
+CLS -> Rank Head    (Linear 192->256->1)
+    -> Attack Head  (Linear 192->128->1)
+    -> Q Head       (Linear 192->256->64->1, with dropout)
 ```
+
+Board feature channels: base occupancy, result occupancy, placement diff, height map, holes,
+row fill ratio, and T-slot cavity map.
 
 ### Inference Scoring
 
@@ -100,13 +106,15 @@ Score(placement) = Rank_Score + alpha * Q_Score    (default alpha = 0.3)
 | Height penalty | 0.1 |
 | Holes penalty | 0.5 |
 | Topout penalty | 10.0 |
+| T-slot ready bonus | 0.3 |
 
 ### Other Defaults
 
 - **Importance weighting**: Moves with line clears, attack > 0, or expert Q >= 1.5 get 6x sample weight
 - **Label smoothing**: 0.05 (on imitation CE loss)
-- **Target network**: EMA with tau=0.005, bootstrapped leaf values activate at epoch 5
-- **Gradient clipping**: Not yet implemented
+- **Target network**: EMA with tau=0.005, bootstrapped leaf values activate at epoch 3
+- **Gradient clipping**: clip grad norm at 1.0 by default (`--grad-clip 0` disables it)
+- **LR schedule**: linear warmup for 500 steps, then cosine decay to `1e-6`
 - **Train/val split**: 90/10
 
 ## Data Files
