@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from typing import List
 
 import numpy as np
@@ -153,8 +152,12 @@ def select_top_k_candidates(
     if len(bfs_results) == 0:
         return [], np.zeros((0,), dtype=np.float32)
 
-    order = np.argsort(scores)[::-1]
-    keep = order[: min(int(top_k), len(order))]
+    keep_count = min(int(top_k), len(bfs_results))
+    if keep_count == len(bfs_results):
+        keep = np.argsort(scores)[::-1]
+    else:
+        keep = np.argpartition(scores, -keep_count)[-keep_count:]
+        keep = keep[np.argsort(scores[keep])[::-1]]
     indices = [int(i) for i in keep.tolist()]
     retained_scores = scores[keep].astype(np.float32, copy=True)
     return indices, retained_scores
@@ -224,7 +227,7 @@ def _simulate_candidate(
     *,
     used_hold: bool,
 ) -> dict | None:
-    sim = copy.deepcopy(action_engine)
+    sim = action_engine.clone()
     if sim.current_piece is None:
         return None
 
@@ -291,9 +294,9 @@ def generate_action_candidates(engine: TetrisEngine, include_hold: bool = True) 
     if engine.current_piece is None or engine.game_over:
         return candidates
 
-    variants: list[tuple[TetrisEngine, bool]] = [(copy.deepcopy(engine), False)]
+    variants: list[tuple[TetrisEngine, bool]] = [(engine.clone(), False)]
     if include_hold:
-        hold_engine = copy.deepcopy(engine)
+        hold_engine = engine.clone()
         if _perform_hold(hold_engine):
             variants.append((hold_engine, True))
 
@@ -353,8 +356,9 @@ def _future_beam_score(
     if depth_remaining <= 0 or engine_after.game_over or engine_after.current_piece is None:
         return 0.0
 
-    beam = [(0.0, copy.deepcopy(engine_after), int(move_number))]
+    beam = [(0.0, engine_after.clone(), int(move_number))]
     best = 0.0
+    keep_count = max(1, int(beam_width))
 
     for depth in range(int(depth_remaining)):
         expanded: list[tuple[float, TetrisEngine, int]] = []
@@ -379,17 +383,21 @@ def _future_beam_score(
                 [float(c["immediate_reward"]) for c in candidates],
                 dtype=np.float32,
             )
-            order = np.argsort(step_scores)[::-1][: max(1, int(beam_width))]
+            if len(step_scores) <= keep_count:
+                order = np.argsort(step_scores)[::-1]
+            else:
+                order = np.argpartition(step_scores, -keep_count)[-keep_count:]
+                order = order[np.argsort(step_scores[order])[::-1]]
             for idx in order.tolist():
                 candidate = candidates[int(idx)]
                 child_score = float(acc_score) + (float(gamma) ** depth) * float(step_scores[int(idx)])
-                expanded.append((child_score, copy.deepcopy(candidate["engine_after"]), node_move + 1))
+                expanded.append((child_score, candidate["engine_after"], node_move + 1))
 
         if not expanded:
             break
 
         expanded.sort(key=lambda item: item[0], reverse=True)
-        beam = expanded[: max(1, int(beam_width))]
+        beam = expanded[:keep_count]
         best = max(best, float(beam[0][0]))
 
     if beam:

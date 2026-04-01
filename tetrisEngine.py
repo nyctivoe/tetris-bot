@@ -404,6 +404,13 @@ class Piece:
     def __str__(self):
         return f"{self.kind} at {self.position} (Rot {self.rotation})"
 
+    def copy(self):
+        clone = Piece(self.kind, rotation=self.rotation, position=tuple(self.position))
+        clone.last_action_was_rotation = bool(self.last_action_was_rotation)
+        clone.last_rotation_dir = self.last_rotation_dir
+        clone.last_kick_index = self.last_kick_index
+        return clone
+
 
 class TetrisEngine:
     def __init__(self, spin_mode: str = "t_only", rng=None):
@@ -449,6 +456,44 @@ class TetrisEngine:
         self.incoming_garbage = []
         self.garbage_col = None
         self.generate_bag()
+
+    def _clone_rng(self):
+        rng = self.rng
+        if rng is None or rng is np.random:
+            return rng
+        bit_generator = getattr(rng, "bit_generator", None)
+        if bit_generator is None:
+            return rng
+        clone_bit_generator = bit_generator.__class__()
+        clone_bit_generator.state = bit_generator.state
+        return np.random.Generator(clone_bit_generator)
+
+    def clone(self):
+        clone = self.__class__.__new__(self.__class__)
+        clone.spin_mode = self.spin_mode
+        clone.rng = self._clone_rng()
+        clone.board = self.board.copy()
+        clone.current_piece = None if self.current_piece is None else self.current_piece.copy()
+        clone.bag = self.bag.copy()
+        clone.hold = self.hold
+        clone.bag_size = int(self.bag_size)
+        clone.b2b_chain = int(self.b2b_chain)
+        clone.surge_charge = int(self.surge_charge)
+        clone.last_clear_stats = None if self.last_clear_stats is None else dict(self.last_clear_stats)
+        clone.combo = int(self.combo)
+        clone.combo_active = bool(self.combo_active)
+        clone.game_over = bool(self.game_over)
+        clone.game_over_reason = self.game_over_reason
+        clone.last_spawn_was_clutch = bool(self.last_spawn_was_clutch)
+        clone.last_end_phase = None if self.last_end_phase is None else dict(self.last_end_phase)
+        clone.incoming_garbage = [dict(batch) for batch in self.incoming_garbage]
+        clone.garbage_col = self.garbage_col
+        return clone
+
+    def __deepcopy__(self, memo):
+        clone = self.clone()
+        memo[id(self)] = clone
+        return clone
 
     def generate_bag(self):
         # Standard 7-bag randomizer

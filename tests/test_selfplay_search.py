@@ -81,3 +81,27 @@ def test_generate_action_candidates_includes_hold_branch():
 
     assert candidates
     assert any(candidate["placement"].get("used_hold") for candidate in candidates)
+
+
+def test_engine_clone_copies_state_without_sharing_rng_or_board():
+    engine = create_selfplay_engine("all_spin", seed=0)
+    engine.board[39, 0] = 9
+
+    clone = engine.clone()
+    clone.board[39, 1] = 7
+
+    assert engine.board[39, 1] == 0
+    assert clone.board[39, 0] == 9
+
+    engine.incoming_garbage = []
+    clone.incoming_garbage = []
+    engine.garbage_col = None
+    clone.garbage_col = None
+
+    engine.add_incoming_garbage(lines=1, timer=1)
+    clone.add_incoming_garbage(lines=1, timer=1)
+    assert engine.incoming_garbage[0]["col"] == clone.incoming_garbage[0]["col"]
+
+    engine.add_incoming_garbage(lines=1, timer=1)
+    clone.add_incoming_garbage(lines=1, timer=1)
+    assert engine.incoming_garbage[1]["col"] == clone.incoming_garbage[1]["col"]
