@@ -50,12 +50,12 @@ from tetrisEngine import (
     Piece,
 )
 from model import (
-    TetrisFormerV4WithTarget,
     compute_board_features,
     encode_stats,
     _encode_queue,
     get_device,
 )
+from rl.model_loader import load_tetrisformer_checkpoint
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -432,34 +432,13 @@ class TetrisInferenceUI:
 
     def _load_model(self, path: str):
         """Load a TetrisFormer checkpoint."""
-        import torch
-
         print(f"Loading model from {path} ...")
-        ckpt = torch.load(path, map_location="cpu", weights_only=False)
-
-        # Detect architecture
-        state = ckpt.get("model_state_dict", ckpt)
-        config = ckpt.get("config", {})
-
-        embed_dim = 128
-        num_heads = 4
-        depth = 4
-        # Try to infer from state dict keys
-        for k, v in state.items():
-            if "cls_token" in k and hasattr(v, "shape"):
-                embed_dim = v.shape[-1]
-            if "transformer.layers" in k:
-                pass
-
-        model = TetrisFormerV4WithTarget(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            depth=depth,
-        )
-        model.load_state_dict(state, strict=False)
-        model.model.to(self.device)
-        model.eval()
-        self.model = model.model  # Use inner model for inference
+        bundle = load_tetrisformer_checkpoint(path, device=self.device, eval_mode=True)
+        if bundle.spin_mode != "all_spin":
+            print(
+                f"[warn] checkpoint spin_mode={bundle.spin_mode!r}; modern all-spin analysis expects 'all_spin'."
+            )
+        self.model = bundle.model
         self.model_path = path
         print(f"Model loaded successfully (device: {self.device})")
 

@@ -1,137 +1,147 @@
 # TetrisFormer
 
-A transformer-based deep learning model that learns to play Tetris from expert human replays. Uses a CNN + transformer hybrid with three output heads trained via multi-task imitation learning and Q-learning.
-
-## Overview
-
-TetrisFormer V4 ("Search-Distilled Candidate Q Learning") processes 76,693 expert TETR.IO game replays (7.7 GB CSV) to learn piece placement decisions. For each board state, it evaluates candidate placements produced by BFS and ranks them using a combination of:
-
-- **Rank head** — soft ranking via rollout-return distributions over candidate moves
-- **Q head** — per-candidate rollout return regression (SmoothL1Loss)
-- **Attack head** — immediate garbage attack prediction (SmoothL1Loss)
-- **Imitation loss** — weak expert move classification on the rank logits (CrossEntropyLoss with label_smoothing=0.05)
+TetrisFormer is a CNN + transformer model trained on expert TETR.IO replays. The current training path uses rollout-ranked BFS candidates, replay-aligned T-only spin semantics, and cache v3 preprocessing.
 
 ## Requirements
 
-- Python 3.10+
-- [uv](https://docs.astral.sh/uv/) package manager
-- CUDA GPU recommended (falls back to CPU)
-- Optional: [numba](https://numba.pydata.org/) for accelerated garbage-row matching in data loading
+- Python 3.13
+- [uv](https://docs.astral.sh/uv/)
+- CUDA recommended, CPU supported
+
+Install dependencies with:
+
+```bash
+uv sync
+```
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-uv sync
+# Build the byte-offset index if game_index.csv does not exist yet.
 
-# Build game index (required once, creates game_index.csv)
-# This is done automatically if game_index.csv does not exist.
+# Precompute cache v3 from replay data.
+uv run python preparse_games.py --cache-dir game_cache_v3
 
-# Preprocess BFS cache (currently required for training, creates game_cache_v2/)
-uv run python preparse_games.py
-
-# Run training
-uv run python model.py
+# Train against cache v3.
+uv run python model.py --cache-dir game_cache_v3
 ```
 
-## Architecture
+Smoke commands used for the current pipeline:
 
-### Source Files
+```bash
+uv run python preparse_games.py --limit-games 10 --cache-dir game_cache_v3
+uv run python tools/replay_alignment_report.py --cache-dir game_cache_v3 --sample-size 5000
+uv run python model.py --cache-dir game_cache_v3 --num-workers 0 --batch-size 2 --batches-per-epoch 1 --val-batches 1
+```
+
+## Source Files
 
 | File | Role |
 |------|------|
-| `model.py` | Model definition (`TetrisFormerV4`), dataset (`SmartRolloutRankDataset`), training loop |
-| `tetrisEngine.py` | Tetris simulation engine with SRS wall kicks + BFS candidate generation |
-| `fileParsing.py` | CSV loading with byte-offset indexing, board parsing, BFS match alignment |
-| `preparse_games.py` | Offline BFS cache builder (outputs to `game_cache_v2/`) |
+| `model.py` | `TetrisFormerV4`, cache v3 dataset loading, rollout target generation, training loop |
+| `tetrisEngine.py` | Tetris simulation engine, BFS placement generation, default T-only spin detection |
+| `fileParsing.py` | CSV loading, replay indexing, board parsing, BFS/result alignment |
+| `preparse_games.py` | Cache v3 builder |
+| `tools/replay_alignment_report.py` | Replay-vs-engine audit for cache v3 |
 
-### Model: TetrisFormerV4
+## Model Architecture
 
-```
+```text
 7-channel board features (40x10)
-    -> CNN stem (Conv 7->32, 3x3 + BN + ReLU)
-    -> Residual block (32->64, stride 2)
-    -> Residual block (64->192, stride 2)
-    -> 30 grid tokens (10x3, 192-dim) + 2D sin/cos positional encoding
+  -> Conv2d(7 -> 32, 3x3) + BN + ReLU
+  -> Residual block (32 -> 64, stride 2)
+  -> Residual block (64 -> 192, stride 2)
+  -> 30 grid tokens (10x3, 192-dim) + 2D sin/cos positional encoding
 
-CLS token + Stats token (7 scalars -> Linear 7->192) + Queue tokens (7: current/placed + hold + 5 next)
-    -> Transformer Encoder (4 layers, 6 heads, 192-dim, FFN=768, dropout=0.1, pre-LN)
-    -> CLS output
+Queue tokens: 7 total
+  current/placed + hold + 5 next pieces
 
-CLS -> Rank Head    (Linear 192->256->1)
-    -> Attack Head  (Linear 192->128->1)
-    -> Q Head       (Linear 192->256->64->1, with dropout)
+Transformer encoder
+  d_model=192
+  depth=4
+  heads=6
+  ffn=768
+  dropout=0.1
+  norm_first=True
+
+Heads
+  rank:   192 -> 256 -> 1
+  attack: 192 -> 128 -> 1
+  q:      192 -> 256 -> 64 -> 1
 ```
 
-Board feature channels: base occupancy, result occupancy, placement diff, height map, holes,
-row fill ratio, and T-slot cavity map.
+Board feature channels are: base occupancy, result occupancy, placement diff, height map, holes, row fill ratio, and T-slot cavity heuristic.
 
-### Inference Scoring
+Inference score:
 
+```text
+score = rank + alpha * q
 ```
-Score(placement) = Rank_Score + alpha * Q_Score    (default alpha = 0.3)
-```
+
+Default `alpha` is `0.3`.
+
+## Training Semantics
+
+- Cache version: `game_cache_v3`
+- Spin mode: replay-aligned T-only by default
+- Bootstrap / EMA target network: disabled
+- Checkpoint filename: `tetrisformer_v4r1_ep{epoch}.pt`
+- Checkpoint metadata includes `cache_version=3`, `spin_mode="t_only"`, and `bootstrap_enabled=false`
+
+Validation now resets each epoch. Training hard-fails on non-v3 caches and instructs you to rerun preprocessing.
 
 ## Training Defaults
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--k-candidates` | 10 | Candidates per move (1 expert + 9 negatives) |
-| `--batch-size` | 128 | Batch size |
-| `--lr` | 2e-4 | Learning rate (AdamW, weight_decay=1e-2) |
-| `--epochs` | 25 | Training epochs |
-| `--samples-per-epoch` | 250,000 | Samples per epoch |
-| `--rollout-depth` | 6 | Beam-search rollout lookahead depth |
-| `--rollout-beam` | 2 | Beam width |
-| `--rollout-expand` | 6 | Expansion width per beam node |
-| `--gamma` | 0.97 | Discount factor |
-| `--soft-target-temp` | 0.5 | Temperature for soft rank targets |
+| Parameter | Default |
+|-----------|---------|
+| `--k-candidates` | `10` |
+| `--batch-size` | `128` |
+| `--epochs` | `25` |
+| `--lr` | `2e-4` |
+| `--rollout-depth` | `6` |
+| `--rollout-beam` | `2` |
+| `--rollout-expand` | `6` |
+| `--gamma` | `0.97` |
+| `--soft-target-temp` | `0.5` |
+| `--q-target-scale` | `20.0` |
+| `--attack-target-scale` | `12.0` |
+| `--grad-clip` | `1.0` |
+| `--warmup-steps` | `500` |
+| `--min-lr` | `1e-6` |
 
-### Loss Weights
-
-| Loss | Weight | Description |
-|------|--------|-------------|
-| Soft rank | 1.0 | KL-divergence against rollout-return distribution |
-| Q regression | 1.0 | SmoothL1 on per-candidate rollout returns |
-| Attack regression | 0.1 | SmoothL1 on immediate garbage prediction |
-| Imitation | 0.5 | CrossEntropy on expert move label |
-
-### Reward Shaping
+Reward defaults:
 
 | Parameter | Default |
 |-----------|---------|
-| Attack weight | 1.0 |
-| T-spin bonus | 1.5 |
-| B2B bonus | 0.5 |
-| Height penalty | 0.1 |
-| Holes penalty | 0.5 |
-| Topout penalty | 10.0 |
-| T-slot ready bonus | 0.3 |
+| `--reward-attack-weight` | `1.0` |
+| `--reward-tspin-bonus` | `1.5` |
+| `--reward-b2b-bonus` | `0.5` |
+| `--reward-height-penalty` | `0.1` |
+| `--reward-holes-penalty` | `0.5` |
+| `--reward-topout-penalty` | `10.0` |
+| `--reward-tslot-ready-bonus` | `0.3` |
 
-### Other Defaults
+Other defaults:
 
-- **Importance weighting**: Moves with line clears, attack > 0, or expert Q >= 1.5 get 6x sample weight
-- **Label smoothing**: 0.05 (on imitation CE loss)
-- **Target network**: EMA with tau=0.005, bootstrapped leaf values activate at epoch 3
-- **Gradient clipping**: clip grad norm at 1.0 by default (`--grad-clip 0` disables it)
-- **LR schedule**: linear warmup for 500 steps, then cosine decay to `1e-6`
-- **Train/val split**: 90/10
+- importance weighting: `6x` for line-clear / attack / high-Q samples
+- label smoothing: `0.05`
+- train/val split: `90/10`
 
-## Data Files
+## Data Artifacts
 
-| File | Size | Description |
-|------|------|-------------|
-| `data.csv` | ~7.7 GB | Raw game replays (board state, piece info, ratings, attack stats) |
-| `game_index.csv` | ~2.5 MB | Byte-offset index for fast random game access |
-| `game_cache_v2/` | ~48 GB | Preprocessed BFS states (currently required for training) |
-| `checkpoints/` | varies | Saved model weights |
+| Path | Description |
+|------|-------------|
+| `data.csv` | Raw replay rows |
+| `game_index.csv` | Byte-offset replay index |
+| `game_cache_v3/` | Required preprocessed cache for training |
+| `checkpoints/` | Saved checkpoints |
 
-## CLI Reference
+## CLI Notes
 
-```bash
-uv run python model.py --help
-```
+Useful arguments:
 
-Key arguments: `--data-path`, `--index-path`, `--epochs`, `--lr`, `--batch-size`, `--k-candidates`, `--num-workers`, `--rollout-depth`, `--rollout-beam`, `--samples-per-epoch`
+- `model.py`: `--cache-dir`, `--data-path`, `--index-path`, `--num-workers`, `--batch-size`, `--batches-per-epoch`, `--val-batches`
+- `preparse_games.py`: `--cache-dir`, `--overwrite`, `--limit-games`
+- `tools/replay_alignment_report.py`: `--cache-dir`, `--sample-size`, `--seed`
 
-Use `--num-workers 0` to disable multiprocessing if issues arise.
+Use `--num-workers 0` if multiprocessing causes issues on your machine.

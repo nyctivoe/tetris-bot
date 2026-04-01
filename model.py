@@ -65,6 +65,10 @@ HIDDEN_ROWS = BOARD_H - VISIBLE_H
 NUM_BOARD_CHANNELS = 7
 NUM_STATS = 7
 QUEUE_SLOTS = 5
+CACHE_VERSION = 3
+DEFAULT_CACHE_DIR_NAME = "game_cache_v3"
+DEFAULT_SPIN_MODE = "t_only"
+CHECKPOINT_ARCH = "tetrisformer_v4r1"
 
 
 # ===========================================================================
@@ -430,91 +434,6 @@ class TetrisFormerV4(nn.Module):
         return rank_score, pred_attack, pred_q
 
 
-# ---------------------------------------------------------------------
-# Target-network registry (fork-safe: shared memory, CPU-resident)
-# ---------------------------------------------------------------------
-_TARGET_MODEL_REGISTRY: Dict[str, object] = {}
-
-
-def register_target_model(model: "TetrisFormerV4WithTarget", device) -> None:
-    """Call once in the main process before DataLoader workers are spawned.
-
-    The target model is put into shared memory so fork-based workers can
-    read the latest weights without IPC overhead.
-    """
-    target = model.target_model.cpu()
-    target.share_memory()
-    target.eval()
-    _TARGET_MODEL_REGISTRY["target"] = target
-
-
-def _get_target_model() -> Optional["TetrisFormerV4"]:
-    return _TARGET_MODEL_REGISTRY.get("target")
-
-
-def _encode_engine_state_for_model(engine) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Encode a live TetrisEngine state into (board_feat, queue, stats) arrays."""
-    board = engine.board
-    board_feat = compute_board_features(board, board)
-
-    cur = getattr(engine, "current_piece", None)
-    placed_kind = str(cur.kind) if cur else None
-    hold_kind = engine.hold
-    if isinstance(hold_kind, int):
-        hold_kind = PIECE_ID_TO_KIND.get(hold_kind)
-
-    bag = engine.bag if engine.bag is not None else []
-    next_str = "".join(PIECE_ID_TO_KIND.get(int(x), "") for x in bag[:5])
-    queue_seq = _encode_queue(placed_kind, hold_kind, next_str)
-
-    stats_row = {
-        "b2b_chain": engine.b2b_chain,
-        "btb": engine.b2b_chain,
-        "combo": engine.combo,
-        "incoming_garbage": sum(g["lines"] for g in (engine.incoming_garbage or [])),
-        "move_number": 0,
-    }
-    stats_feat = encode_stats(stats_row, board, board)
-    return board_feat, queue_seq, stats_feat
-
-
-class TetrisFormerV4WithTarget(nn.Module):
-    """TetrisFormerV4 plus an EMA target network (AlphaZero / DQN style).
-
-    Only ``self.model`` receives gradients.  ``self.target_model`` is kept
-    on CPU in shared memory so DataLoader workers can read it during rollouts.
-
-    Usage
-    -----
-    After creating, call ``register_target_model(wrapped, device)`` once
-    before creating the DataLoader.  During training call
-    ``wrapped.update_target(tau)`` to soft-update the EMA weights.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.model = TetrisFormerV4(**kwargs)
-        self.target_model = copy.deepcopy(self.model)
-        self.target_model.requires_grad_(False)
-
-    def update_target(self, tau: float = 0.005) -> None:
-        """Polyak / EMA update: target ← (1-τ)·target + τ·model."""
-        cpu_params = {n: p.cpu().detach() for n, p in self.model.named_parameters()}
-        for name, tp in self.target_model.named_parameters():
-            if name in cpu_params:
-                tp.data.lerp_(cpu_params[name], tau)
-
-    def forward(self, x_board, x_queue, x_stats):
-        return self.model(x_board, x_queue, x_stats)
-
-    def train(self, mode: bool = True):
-        self.model.train(mode)
-        self.target_model.eval()
-        return self
-
-    def eval(self):
-        return self.train(False)
-
 
 # ---------------------------------------------------------------------
 # Engine state helpers
@@ -523,7 +442,7 @@ def _clone_engine(engine):
     try:
         return copy.deepcopy(engine)
     except Exception:
-        clone = engine.__class__()
+        clone = engine.__class__(spin_mode=getattr(engine, "spin_mode", DEFAULT_SPIN_MODE))
         clone.board = engine.board.copy()
 
         for attr in [
@@ -531,7 +450,8 @@ def _clone_engine(engine):
             "b2b_chain", "surge_charge",
             "last_clear_stats", "combo", "combo_active",
             "game_over", "game_over_reason",
-            "last_spawn_was_clutch", "last_end_phase"
+            "last_spawn_was_clutch", "last_end_phase",
+            "incoming_garbage", "garbage_col"
         ]:
             if hasattr(engine, attr):
                 setattr(clone, attr, copy.deepcopy(getattr(engine, attr)))
@@ -551,21 +471,43 @@ def _clone_engine(engine):
         return clone
 
 
-def _set_engine_root_state(engine, row: dict, base_board: np.ndarray, placed_kind: str):
+def _set_engine_root_state(engine, step_info: dict):
+    base_board = step_info["base_board"]
+    pre_state = step_info["pre_state"]
+    queue_state = step_info["queue_state"]
+    placed_kind = _safe_piece_str(queue_state.get("current") or step_info.get("placed"))
+
     engine.board = base_board.copy()
+    if hasattr(engine, "bag"):
+        engine.bag = np.array([], dtype=int)
+    if hasattr(engine, "bag_size"):
+        engine.bag_size = 0
 
     if hasattr(engine, "combo"):
-        engine.combo = _safe_int(row.get("combo", 0))
+        engine.combo = _safe_int(pre_state.get("combo", 0))
     if hasattr(engine, "combo_active"):
-        engine.combo_active = bool(_safe_int(row.get("combo", 0)) > 0)
+        engine.combo_active = bool(pre_state.get("combo_active", engine.combo > 0))
     if hasattr(engine, "b2b_chain"):
-        engine.b2b_chain = _safe_int(row.get("btb", row.get("b2b_chain", 0)))
+        engine.b2b_chain = _safe_int(pre_state.get("b2b_chain", 0))
+    if hasattr(engine, "surge_charge"):
+        engine.surge_charge = _safe_int(pre_state.get("surge_charge", 0))
     if hasattr(engine, "hold"):
-        engine.hold = _safe_piece_str(row.get("hold")) or None
+        engine.hold = _safe_piece_str(queue_state.get("hold")) or None
+    if hasattr(engine, "incoming_garbage"):
+        incoming_total = _safe_int(pre_state.get("incoming_garbage_total", 0))
+        engine.incoming_garbage = (
+            [{"lines": incoming_total, "timer": 0, "col": 0}]
+            if incoming_total > 0
+            else []
+        )
+    if hasattr(engine, "garbage_col"):
+        engine.garbage_col = None
 
     engine.game_over = False
     engine.game_over_reason = None
     engine.last_clear_stats = None
+    if hasattr(engine, "last_end_phase"):
+        engine.last_end_phase = None
 
     engine.current_piece = engine.spawn_piece(placed_kind)
     if engine.current_piece is None:
@@ -628,10 +570,8 @@ def _is_tspin_from_stats(clear_stats: dict) -> float:
     if clear_stats.get("lines_cleared", 0) <= 0:
         return 0.0
     spin = clear_stats.get("spin")
-    if isinstance(spin, dict):
-        desc = str(spin.get("description", "")).lower()
-        if "t-spin" in desc or "tspin" in desc:
-            return 1.0
+    if isinstance(spin, dict) and spin.get("spin_type") == "t-spin":
+        return 1.0
     return 0.0
 
 
@@ -697,11 +637,11 @@ def _simulate_current_placement(engine,
 
     prev_b2b = int(getattr(sim, "b2b_chain", 0))
 
-    sim.lock_and_spawn()
+    sim.lock_piece(run_end_phase=False)
     clear_stats = sim.last_clear_stats or {}
 
-    # Patch next spawn to actual replay piece, not random bag spawn.
-    if next_piece_kind:
+    # Patch next spawn to the actual replay piece, not a random bag spawn.
+    if not sim.game_over and next_piece_kind:
         actual_next = sim.spawn_piece(next_piece_kind)
         can_spawn = False
         if actual_next is not None:
@@ -721,10 +661,7 @@ def _simulate_current_placement(engine,
             sim.game_over = True
             sim.game_over_reason = "block_out"
     else:
-        # Horizon ended; ignore any random-spawn blockout from lock_and_spawn.
         sim.current_piece = None
-        sim.game_over = False
-        sim.game_over_reason = None
 
     reward, attack = _compute_rollout_reward(
         sim.board, clear_stats, prev_b2b, bool(sim.game_over),
@@ -732,23 +669,6 @@ def _simulate_current_placement(engine,
         height_penalty, holes_penalty, topout_penalty, tslot_ready_bonus
     )
     return sim, reward, attack
-
-
-def _leaf_value_from_target(engine) -> float:
-    """Evaluate V(leaf) using the shared target network (returns 0.0 if unavailable)."""
-    target = _get_target_model()
-    if target is None or engine.game_over:
-        return 0.0
-    try:
-        board_feat, queue_seq, stats_feat = _encode_engine_state_for_model(engine)
-        board_t = torch.from_numpy(board_feat[np.newaxis].astype(np.float32))
-        queue_t = torch.from_numpy(queue_seq[np.newaxis].astype(np.int64))
-        stats_t = torch.from_numpy(stats_feat[np.newaxis].astype(np.float32))
-        with torch.no_grad():
-            _, _, leaf_q = target(board_t, queue_t, stats_t)
-        return float(leaf_q.item())
-    except Exception:
-        return 0.0
 
 
 def _beam_rollout_future(engine_after_root,
@@ -764,11 +684,8 @@ def _beam_rollout_future(engine_after_root,
                          height_penalty: float,
                          holes_penalty: float,
                          topout_penalty: float,
-                         bootstrap_leaf: bool = False,
                          tslot_ready_bonus: float = 0.0) -> float:
     if depth_remaining <= 0:
-        if bootstrap_leaf:
-            return _leaf_value_from_target(engine_after_root)
         return 0.0
 
     root = {
@@ -843,15 +760,7 @@ def _beam_rollout_future(engine_after_root,
         best = max(best, float(beam[0]["score"]))
 
     if beam:
-        if bootstrap_leaf:
-            # γ^depth_remaining · V(leaf) added to each surviving beam node.
-            leaf_scores = [
-                float(n["score"]) + (gamma ** depth_remaining) * _leaf_value_from_target(n["engine"])
-                for n in beam
-            ]
-            best = max(best, max(leaf_scores))
-        else:
-            best = max(best, max(float(n["score"]) for n in beam))
+        best = max(best, max(float(n["score"]) for n in beam))
     return float(best)
 
 
@@ -868,7 +777,6 @@ def _compute_candidate_rollout_q(root_engine,
                                  height_penalty: float,
                                  holes_penalty: float,
                                  topout_penalty: float,
-                                 bootstrap_leaf: bool = False,
                                  tslot_ready_bonus: float = 0.0) -> Tuple[float, float]:
     next_piece_kind = future_piece_kinds[0] if len(future_piece_kinds) > 0 else None
 
@@ -899,7 +807,6 @@ def _compute_candidate_rollout_q(root_engine,
         height_penalty=height_penalty,
         holes_penalty=holes_penalty,
         topout_penalty=topout_penalty,
-        bootstrap_leaf=bootstrap_leaf,
         tslot_ready_bonus=tslot_ready_bonus,
     )
 
@@ -944,10 +851,10 @@ class SmartRolloutRankDataset(IterableDataset):
                  reward_topout_penalty=2.5,
                  reward_tslot_ready_bonus=0.0,
                  seed=1234,
-                 use_bootstrap=False):
+                 cache_dir=None):
         self.entries = entries
-        self.use_bootstrap = bool(use_bootstrap)
         self.data_path = data_path
+        self.cache_dir = cache_dir or os.path.join(_HERE, DEFAULT_CACHE_DIR_NAME)
         self.k_candidates = int(k_candidates)
         self.max_garbage = int(max_garbage)
         self.max_games = max_games
@@ -986,11 +893,8 @@ class SmartRolloutRankDataset(IterableDataset):
 
         import time
         rng = np.random.default_rng(self.seed + 1000 * worker_id)
-        EngineClass = _get_game_functions()[0]
-        
-        print(f"[Worker {worker_id}] STARTED | Entries: {len(my_entries)} | PID: {os.getpid()}")
 
-        cache_dir = os.path.join(os.path.dirname(self.data_path), "game_cache_v2")
+        print(f"[Worker {worker_id}] STARTED | Entries: {len(my_entries)} | PID: {os.getpid()}")
 
         games_seen = 0
         samples_seen = 0
@@ -1001,7 +905,7 @@ class SmartRolloutRankDataset(IterableDataset):
             if self.max_games and games_seen >= self.max_games:
                 break
 
-            cache_path = os.path.join(cache_dir, f"{entry['game_id']}.pt")
+            cache_path = os.path.join(self.cache_dir, f"{entry['game_id']}.pt")
             if not os.path.exists(cache_path):
                 continue
 
@@ -1010,21 +914,30 @@ class SmartRolloutRankDataset(IterableDataset):
 
 
             game_data = torch.load(cache_path, weights_only=False)
+            cache_version = int(game_data.get("cache_version", 0) or 0)
+            if cache_version != CACHE_VERSION:
+                raise RuntimeError(
+                    f"Unsupported cache version in {cache_path}: expected v{CACHE_VERSION}, "
+                    f"found v{cache_version or 'missing'}. Rerun `uv run python preparse_games.py`."
+                )
             steps = game_data.get("steps", [])
             games_seen += 1
+            EngineClass = _get_game_functions()[0]
 
             for step_info in steps:
                 if self.max_samples and samples_seen >= self.max_samples:
                     return
 
                 step_start = time.time()
-                row = step_info["row"]
                 placed = step_info["placed"]
                 base_board = step_info["base_board"]
                 match_idx = step_info["expert_match_index"]
                 valid_indices = step_info["valid_indices"]
                 bfs_boards = step_info["bfs_boards"]
                 bfs_placements = step_info["bfs_placements"]
+                queue_state = step_info["queue_state"]
+                pre_state = step_info["pre_state"]
+                expert_replay = step_info["expert_replay"]
                 
                 # We cap rollout depth to what we asked for in args
                 future_piece_kinds = step_info["future_pieces"][:self.rollout_depth]
@@ -1043,15 +956,24 @@ class SmartRolloutRankDataset(IterableDataset):
                 expert_label = int(selected.index(match_idx))
 
                 # Prepare the Root Engine for Q-Rollout
-                root_engine = EngineClass()
+                root_engine = EngineClass(spin_mode=DEFAULT_SPIN_MODE)
                 try:
-                    _set_engine_root_state(root_engine, row, base_board, placed)
+                    _set_engine_root_state(root_engine, step_info)
                 except Exception:
                     continue
 
-                queue_seq = _encode_queue(placed, row.get("hold"), row.get("next"))
-                row_for_stats = dict(row)
-                row_for_stats["move_number"] = step_info["move_number"]
+                queue_seq = _encode_queue(
+                    queue_state.get("current") or placed,
+                    queue_state.get("hold"),
+                    queue_state.get("next_queue"),
+                )
+                row_for_stats = {
+                    "incoming_garbage": pre_state.get("incoming_garbage_total", 0),
+                    "combo": pre_state.get("combo", 0),
+                    "btb": pre_state.get("b2b_chain", 0),
+                    "b2b_chain": pre_state.get("b2b_chain", 0),
+                    "move_number": step_info["move_number"],
+                }
 
                 boards_list, queues_list, stats_list = [], [], []
                 q_raw_list, attack_raw_list = [], []
@@ -1080,7 +1002,6 @@ class SmartRolloutRankDataset(IterableDataset):
                         height_penalty=self.reward_height_penalty,
                         holes_penalty=self.reward_holes_penalty,
                         topout_penalty=self.reward_topout_penalty,
-                        bootstrap_leaf=self.use_bootstrap and (_get_target_model() is not None),
                         tslot_ready_bonus=self.reward_tslot_ready_bonus,
                     )
                     q_raw_list.append(q_raw)
@@ -1094,8 +1015,8 @@ class SmartRolloutRankDataset(IterableDataset):
                 attack_targets = np.clip(attack_raw_arr / max(self.attack_target_scale, 1e-6), 0.0, 2.0)
 
                 expert_q = float(q_raw_arr[expert_label])
-                actual_attack = float(_safe_float(row.get("attack", 0)))
-                actual_cleared = float(_safe_float(row.get("cleared", 0)))
+                actual_attack = float(_safe_float(expert_replay.get("attack", 0)))
+                actual_cleared = float(_safe_float(expert_replay.get("cleared", 0)))
 
                 sample_weight = self.important_weight if (
                     actual_attack > 0.0 or actual_cleared > 0.0 or expert_q >= self.important_q_threshold
@@ -1137,6 +1058,7 @@ def main():
     from fileParsing import DATA_PATH as _DEFAULT_DATA, INDEX_PATH as _DEFAULT_INDEX
     parser.add_argument("--data-path",  default=_DEFAULT_DATA)
     parser.add_argument("--index-path", default=_DEFAULT_INDEX)
+    parser.add_argument("--cache-dir",  default=os.path.join(_HERE, DEFAULT_CACHE_DIR_NAME))
     parser.add_argument("--save-dir",   default=os.path.join(_HERE, "checkpoints"))
 
     parser.add_argument("--epochs", type=int, default=25)            # was 15; RL needs more time to converge
@@ -1181,12 +1103,6 @@ def main():
 
     parser.add_argument("--rank-q-alpha", type=float, default=0.3)     # was 0.25; slight favour toward rank signal
     parser.add_argument("--log-every", type=int, default=500)
-
-    # Bootstrapped value leaves (AlphaZero trick)
-    parser.add_argument("--bootstrap-start-epoch", type=int, default=3,
-                        help="Epoch after which leaf states are bootstrapped via target network.")
-    parser.add_argument("--target-ema-tau", type=float, default=0.005,
-                        help="Polyak coefficient for EMA target network update.")
 
     # Training stability / efficiency
     parser.add_argument("--grad-clip", type=float, default=1.0,
@@ -1237,6 +1153,7 @@ def main():
         reward_topout_penalty=args.reward_topout_penalty,
         reward_tslot_ready_bonus=args.reward_tslot_ready_bonus,
         seed=args.seed,
+        cache_dir=args.cache_dir,
     )
 
     val_set = SmartRolloutRankDataset(
@@ -1261,7 +1178,7 @@ def main():
         reward_topout_penalty=args.reward_topout_penalty,
         reward_tslot_ready_bonus=args.reward_tslot_ready_bonus,
         seed=args.seed + 999,
-        use_bootstrap=False,   # bootstrap toggled per-epoch below
+        cache_dir=args.cache_dir,
     )
 
     _wif = _dataloader_worker_init if args.num_workers > 0 else None
@@ -1285,16 +1202,13 @@ def main():
         worker_init_fn=_wif,
     )
 
-    model = TetrisFormerV4WithTarget(
+    model = TetrisFormerV4(
         board_channels=NUM_BOARD_CHANNELS,
         num_stats=NUM_STATS,
     )
-    model.model.to(device)
+    model.to(device)
 
-    # Register target on CPU in shared memory so DataLoader workers can read it.
-    register_target_model(model, device)
-
-    optimizer = optim.AdamW(model.model.parameters(), lr=args.lr, weight_decay=1e-2)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
 
     # Cosine LR schedule with linear warmup.
     total_steps_estimate = args.epochs * (args.samples_per_epoch // max(args.batch_size, 1))
@@ -1331,17 +1245,10 @@ def main():
                 )
 
     train_iter = iter(train_loader)
-    val_iter = iter(val_loader)
 
     master_print("Starting v4 training ...")
 
     for epoch in range(1, args.epochs + 1):
-        # Enable bootstrapped leaf values once the Q head is warmed up.
-        bootstrap_active = epoch >= args.bootstrap_start_epoch
-        train_set.use_bootstrap = bootstrap_active
-        if bootstrap_active:
-            master_print(f"  [bootstrap] leaf values active (target EMA τ={args.target_ema_tau})")
-
         model.train()
         master_print(f"--- Epoch {epoch}/{args.epochs} ---")
 
@@ -1434,14 +1341,10 @@ def main():
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.model.parameters(), args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-
-            # Soft-update the EMA target network after every gradient step.
-            if bootstrap_active:
-                model.update_target(tau=args.target_ema_tau)
 
             with torch.no_grad():
                 target_best = torch.argmax(q_targets, dim=1)
@@ -1476,6 +1379,7 @@ def main():
 
         # ---------------- Validation ----------------
         model.eval()
+        val_iter = iter(val_loader)
 
         v_expert = 0
         v_qbest = 0
@@ -1548,10 +1452,14 @@ def main():
             f"Samples {v_samples}"
         )
 
-        ckpt_path = os.path.join(args.save_dir, f"tetrisformer_v4_ep{epoch}.pt")
+        ckpt_path = os.path.join(args.save_dir, f"{CHECKPOINT_ARCH}_ep{epoch}.pt")
         ckpt = {
             "model_state_dict": model.state_dict(),
             "arch": "tetrisformer_v4",
+            "checkpoint_arch": CHECKPOINT_ARCH,
+            "cache_version": CACHE_VERSION,
+            "spin_mode": DEFAULT_SPIN_MODE,
+            "bootstrap_enabled": False,
             "config": vars(args),
         }
         save_checkpoint(ckpt, ckpt_path)

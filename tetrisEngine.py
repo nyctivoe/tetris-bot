@@ -45,9 +45,9 @@ PIECE_DEFS = {
 
     "Z": {"size": 3, "blocks": [(0, 0), (1, 0), (1, 1), (2, 1)]},
 
-    "J": {"size": 3, "blocks": [(0, 0), (0, 1), (1, 1), (2, 1)]},
+    "J": {"size": 3, "blocks": [(2, 0), (0, 1), (1, 1), (2, 1)]},
 
-    "L": {"size": 3, "blocks": [(2, 0), (0, 1), (1, 1), (2, 1)]},
+    "L": {"size": 3, "blocks": [(0, 0), (0, 1), (1, 1), (2, 1)]},
 }
 
 JLSTZ_OFFSETS = {
@@ -406,7 +406,11 @@ class Piece:
 
 
 class TetrisEngine:
-    def __init__(self):
+    def __init__(self, spin_mode: str = "t_only", rng=None):
+        if spin_mode not in {"t_only", "all_spin"}:
+            raise ValueError(f"Unsupported spin mode: {spin_mode}")
+        self.spin_mode = spin_mode
+        self.rng = rng
         self.board = np.zeros((BOARD_HEIGHT, BOARD_WIDTH), dtype=int)
         self.current_piece = None
         self.bag = np.array([], dtype=int)
@@ -453,7 +457,8 @@ class TetrisEngine:
 
         # Ensure we have enough pieces
         while len(self.bag) <= 14:
-            new_bag = np.random.permutation(7) + 1
+            rng = self.rng if self.rng is not None else np.random
+            new_bag = rng.permutation(7) + 1
             if len(self.bag) == 0:
                 self.bag = new_bag
             else:
@@ -1170,7 +1175,8 @@ class TetrisEngine:
         if col is None:
             prev_col = self.incoming_garbage[-1]["col"] if self.incoming_garbage else self.garbage_col
             available = [c for c in range(BOARD_WIDTH) if c != prev_col]
-            col = int(np.random.choice(available))
+            rng = self.rng if self.rng is not None else np.random
+            col = int(rng.choice(available))
         self.incoming_garbage.append({"lines": int(lines), "timer": int(timer), "col": int(col)})
 
     def cancel_garbage(self, attack: int) -> int:
@@ -1230,39 +1236,29 @@ class TetrisEngine:
 
         Pre-condition: Last action must have been a successful rotation.
 
-        T-Spins: 3-Corner Rule + Face Rule
-        All-Spins (J, L, S, Z, I): Immobility Check
+        Default mode: T-Spins only, using the 3-corner rule plus face rule.
+        Optional mode: non-T all-spins via immobility check.
         """
         if not piece.last_action_was_rotation:
             return None
 
         if piece.kind == "T":
             return self._detect_t_spin(piece)
-        elif piece.kind in ("J", "L", "S", "Z", "I"):
+        elif self.spin_mode == "all_spin" and piece.kind in ("J", "L", "S", "Z", "I"):
             return self._detect_all_spin(piece)
 
         return None
 
     def _detect_t_spin(self, piece):
         corners_occupied = self._occupied_3x3_corners(piece)
-        if corners_occupied < 3: return None
+        if corners_occupied < 3:
+            return None
 
-        is_180 = abs(piece.last_rotation_dir) == 2
-
-        if is_180:
-            is_mini = False
-        else:
-            # Use immobility rule: a T-Spin is Full if the piece cannot move
-            # left, right, or up; otherwise it is Mini.
-            px, py = piece.position
-            can_move_left  = self.is_position_valid(piece, (px - 1, py))
-            can_move_right = self.is_position_valid(piece, (px + 1, py))
-            can_move_up    = self.is_position_valid(piece, (px,     py - 1))
-            is_immobile = not (can_move_left or can_move_right or can_move_up)
-            is_mini = not is_immobile
-            # Kick index 4 ("Fin" kick) always promotes to Full T-Spin
-            if piece.last_kick_index == 4:
-                is_mini = False
+        rotation_dir = 0 if piece.last_rotation_dir is None else int(piece.last_rotation_dir)
+        is_180 = abs(rotation_dir) == 2
+        front_corners = self._count_t_front_corners(piece)
+        is_full = is_180 or piece.last_kick_index == 4 or front_corners == 2
+        is_mini = not is_full
 
         return {
             "piece": "T",
@@ -1270,8 +1266,9 @@ class TetrisEngine:
             "is_mini": is_mini,
             "is_180": is_180,
             "corners": corners_occupied,
+            "front_corners": front_corners,
             "kick_index": piece.last_kick_index,
-            "rotation_dir": piece.last_rotation_dir,
+            "rotation_dir": rotation_dir,
             "description": f"{'180 ' if is_180 else ''}T-Spin{' Mini' if is_mini else ''}"
         }
 
@@ -1337,4 +1334,3 @@ class TetrisEngine:
                 occupied += 1
 
         return occupied
-
