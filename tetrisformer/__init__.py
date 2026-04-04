@@ -1,0 +1,1 @@
+"""Legacy TetrisFormer architecture package."""

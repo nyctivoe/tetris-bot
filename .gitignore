@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.pyo
 *.pyd
@@ -10,9 +11,14 @@ venv/
 
 # Training artifacts
 checkpoints/
+runs/
+tmp_*/
 *.pt
 *.pth
 *.ckpt
+runs/**/*.csv
+runs/**/*.json
+runs/**/*.jsonl
 
 # Large/generated data
 data.csv

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-TetrisFormer is a transformer-based deep learning model that learns to play Tetris from expert human replays (76,693 games, 7.7 GB CSV). It uses a CNN + transformer hybrid with three output heads trained via multi-task imitation learning and Q-learning.
+The legacy TetrisFormer stack now lives under `tetrisformer/`, while `tetrisEngine.py` stays at the repo root for reuse by the new architecture.
 
 ## Commands
 
@@ -15,13 +15,13 @@ uv sync
 
 **Run training**:
 ```bash
-uv run python model.py
+uv run python -m tetrisformer.model
 ```
 Key CLI args: `--data-path`, `--index-path`, `--epochs`, `--lr`, `--batch-size`, `--k-candidates`, `--num-workers`, `--rollout-depth`, `--rollout-beam`, `--samples-per-epoch`
 
-**Preprocess/cache BFS states** (one-time, outputs to `game_cache_v2/`):
+**Preprocess/cache BFS states** (one-time, outputs to `game_cache_v3/`):
 ```bash
-uv run python preparse_games.py
+uv run python -m tetrisformer.preparse_games
 ```
 
 There is no test suite.
@@ -39,10 +39,10 @@ Four source files:
 
 | File | Role |
 |------|------|
-| `model.py` | Model definition, dataset, training loop |
+| `tetrisformer/model.py` | Model definition, dataset, training loop |
 | `tetrisEngine.py` | Tetris simulation + BFS candidate generation |
-| `fileParsing.py` | CSV loading, game indexing, board parsing |
-| `preparse_games.py` | Offline BFS cache builder |
+| `tetrisformer/fileParsing.py` | CSV loading, game indexing, board parsing |
+| `tetrisformer/preparse_games.py` | Offline BFS cache builder |
 
 ### Data Flow
 
@@ -50,26 +50,24 @@ Four source files:
 2. For each expert move, `tetrisEngine.py`'s `TetrisEngine.bfs_all_placements()` enumerates all valid piece placements via BFS (SRS wall kicks).
 3. The expert's actual move is matched against BFS candidates. K=10 candidates are sampled (1 expert + 9 negatives) by default.
 4. Each candidate is encoded into **7 channels** (40×10): base board, result board, piece diff, column heights, holes map, row fullness, T-slot cavity map.
-5. `SmartRolloutRankDataset` (IterableDataset) handles this pipeline per-worker, loading from the BFS cache in `game_cache_v2/`.
+5. `SmartRolloutRankDataset` (IterableDataset) handles this pipeline per-worker, loading from the BFS cache in `game_cache_v3/`.
 
 ### Model: `TetrisFormerV4`
 
 ```
 7-channel board (40×10)
-    → CNN Encoder (3 conv layers, stride-2 on layers 2–3) → 30 grid tokens (128-dim)
+    → CNN Encoder (stem + 2 residual conv blocks, stride-2 on layers 2–3) → 30 grid tokens (192-dim)
 
 CLS token + Stats token (7-dim game state) + Queue tokens (7: placed + hold + 5 next)
-    → Transformer Encoder (4 layers, 4 heads, 128-dim, FFN=512)
+    → Transformer Encoder (4 layers, 6 heads, 192-dim, FFN=768, pre-LayerNorm)
     → CLS output
 
-CLS → Rank Head    (Linear 128→256→1)
-    → Attack Head  (Linear 128→128→1, SmoothL1Loss)
-    → Q Head       (Linear 128→256→64→1 with Dropout(0.1), SmoothL1Loss)
+CLS → Rank Head    (Linear 192→256→1)
+    → Attack Head  (Linear 192→128→1, SmoothL1Loss)
+    → Q Head       (Linear 192→256→64→1 with Dropout(0.1), SmoothL1Loss)
 ```
 
 **Loss**: `1.0·SoftRankLoss + 1.0·QLoss + 0.1·AttackLoss + 0.5·ImitationLoss` (defaults). The imitation term is `CrossEntropyLoss(label_smoothing=0.05)` applied to the rank logits.
-
-**Target network**: DQN-style EMA copy (tau=0.005) kept on CPU shared memory for stable Q targets. Bootstrapped leaf values activate at epoch 5 by default.
 
 **Importance weighting**: Moves with line clears, attack > 0, or expert Q ≥ 1.5 get 6× sample weight.
 
@@ -95,7 +93,7 @@ On Windows/Python 3.14+, spawn is the default start method. Worker functions mus
 
 - `data.csv` — 7.7 GB raw game replays (board state, piece info, ratings, attack stats)
 - `game_index.csv` — byte-offset index for fast random game access
-- `game_cache_v2/` — ~48 GB preprocessed BFS states (required for training; build with `preparse_games.py`)
+- `game_cache_v3/` — ~48 GB preprocessed BFS states (required for training; build with `preparse_games.py`)
 - `checkpoints/` — saved model weights (V4 architecture)
 
 ## Current Training Defaults (CLI)
@@ -122,8 +120,6 @@ These are the argparse defaults in `model.py` `main()`:
 | `--important-weight` | 6.0 | |
 | `--important-q-threshold` | 1.5 | |
 | `--rank-q-alpha` | 0.3 | Inference scoring blend |
-| `--bootstrap-start-epoch` | 3 | |
-| `--target-ema-tau` | 0.005 | |
 | `--samples-per-epoch` | 250,000 | |
 | `--grad-clip` | 1.0 | Set to 0 to disable |
 | `--warmup-steps` | 500 | Linear LR warmup before cosine decay |
